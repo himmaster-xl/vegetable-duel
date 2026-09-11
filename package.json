@@ -1,0 +1,14 @@
+{
+  "name": "vegetable-duel",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "双人联机种菜对战小游戏",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "express": "^4.18.2"
+  }
+}

@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>蔬菜大作战 - Vegetable Duel</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/css/style.css?v=7">
+</head>
+<body>
+  <div id="app">
+    <div id="game-container">
+      <canvas id="game-canvas"></canvas>
+    </div>
+
+    <!-- 大厅界面 -->
+    <div id="lobby-overlay" class="overlay">
+      <div class="lobby-box">
+        <h1>🌾 蔬菜农场大作战</h1>
+        <p class="subtitle">星露谷风格农场经营战斗</p>
+        <div class="controls-hint">
+          <h3>🎮 操作说明</h3>
+          <p>WASD / 方向键 — 移动角色</p>
+          <p>E — 与地块交互（翻地/播种/浇水/收获）</p>
+          <p>长按空格 — 蓄力（各蔬菜蓄力时间不同，满蓄力 3 倍速）</p>
+          <p>松开空格 — 蓄力会逐渐衰减，要尽快出手</p>
+          <p>鼠标左键点击 — 朝点击位置投掷蔬菜</p>
+          <p>鼠标右键点下方按钮 — 购买种子</p>
+          <p>1~6 — 选择种子</p>
+          <p>下方按钮 — 购买种子</p>
+        </div>
+        <div class="lobby-inputs">
+          <label>
+            你的昵称:
+            <input type="text" id="player-name" placeholder="输入昵称" maxlength="8">
+          </label>
+          <div class="lobby-buttons">
+            <button id="single-player-btn">🤖 单人测试</button>
+            <button id="multi-player-btn">👥 双人联机</button>
+          </div>
+          <div class="lobby-separator">多人联机</div>
+          <div class="lobby-inputs">
+            <label>
+              房间号:
+              <input type="text" id="room-id-input" placeholder="输入朋友发来的房间号">
+            </label>
+            <button id="join-room-btn">加入房间</button>
+          </div>
+        </div>
+        <p class="hint">双人联机：一人点「双人联机」创建房间，把房间号发给朋友，朋友输入房间号点「加入房间」</p>
+      </div>
+    </div>
+
+    <!-- 多人联机大厅 -->
+    <div id="waiting-overlay" class="overlay" style="display:none;">
+      <div class="lobby-box">
+        <h1>⏳ 等待中...</h1>
+        <p id="waiting-text">等待对手加入...</p>
+        <p id="waiting-room"></p>
+        <p id="waiting-url" style="font-size:13px;color:#9be7a0;line-height:1.7;"></p>
+      </div>
+    </div>
+
+    <!-- 游戏结束界面 -->
+    <div id="gameover-overlay" class="overlay" style="display:none;">
+      <div class="gameover-box">
+        <h1 id="gameover-title">游戏结束</h1>
+        <p id="gameover-message"></p>
+        <button id="restart-btn">再来一局</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 单人模式：无外部依赖，独立运行 -->
+  <script type="module" src="/src/sp-game.js?v=19"></script>
+  <!-- 多人联机模式：加载完整版 -->
+  <script type="module" src="/src/mp-loader.js?v=18"></script>
+</body>
+</html>

@@ -1,0 +1,238 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: #1a1a2e;
+  color: #eee;
+  font-family: 'Courier New', monospace;
+  overflow: hidden;
+  height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+#app {
+  width: 100vw;
+  height: 100vh;
+  position: relative;
+}
+
+#game-container {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  position: relative;
+}
+
+#game-canvas {
+  width: min(96vw, calc(94vh * 16 / 9));
+  height: auto;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  cursor: default;
+  background: #000;
+}
+
+/* 覆盖层通用样式 */
+.overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.88);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 100;
+}
+
+.lobby-box, .gameover-box {
+  background: linear-gradient(135deg, #2d5016, #1a3a0a);
+  border: 3px solid #4CAF50;
+  border-radius: 12px;
+  padding: 36px;
+  text-align: center;
+  max-width: 520px;
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 0 40px rgba(76, 175, 80, 0.3);
+}
+
+.lobby-box h1 {
+  font-size: 30px;
+  color: #FFD700;
+  margin-bottom: 4px;
+  text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+}
+
+.subtitle {
+  font-size: 13px;
+  color: #8BC34A;
+  margin-bottom: 18px;
+}
+
+.controls-hint {
+  background: rgba(0,0,0,0.3);
+  border: 1px solid #4CAF50;
+  border-radius: 8px;
+  padding: 14px 18px;
+  margin-bottom: 22px;
+  text-align: left;
+}
+
+.controls-hint h3 {
+  color: #FFD700;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.controls-hint p {
+  font-size: 12px;
+  color: #ccc;
+  margin: 4px 0;
+  line-height: 1.6;
+}
+
+.controls-hint p kbd {
+  background: #333;
+  border: 1px solid #555;
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 11px;
+  color: #FFD700;
+  font-family: monospace;
+}
+
+#lobby-status {
+  font-size: 16px;
+  color: #aaa;
+  margin-bottom: 20px;
+}
+
+.lobby-inputs {
+  margin: 12px 0;
+}
+
+.lobby-inputs label {
+  display: block;
+  font-size: 14px;
+  color: #ccc;
+  margin-bottom: 8px;
+}
+
+.lobby-inputs input {
+  display: inline-block;
+  width: 250px;
+  margin: 0 auto 10px;
+  padding: 10px 15px;
+  font-size: 14px;
+  font-family: 'Courier New', monospace;
+  background: rgba(0, 0, 0, 0.3);
+  border: 2px solid #4CAF50;
+  border-radius: 6px;
+  color: #fff;
+  outline: none;
+}
+
+.lobby-inputs input:focus {
+  border-color: #8BC34A;
+  box-shadow: 0 0 10px rgba(139, 195, 74, 0.3);
+}
+
+.lobby-buttons {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin: 15px 0;
+}
+
+.lobby-buttons button {
+  padding: 12px 24px;
+  font-size: 14px;
+  font-family: 'Courier New', monospace;
+  font-weight: bold;
+  background: #4CAF50;
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.lobby-buttons button:hover {
+  background: #66BB6A;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(76, 175, 80, 0.4);
+}
+
+.lobby-separator {
+  margin: 15px 0;
+  color: #666;
+  font-size: 12px;
+  border-top: 1px solid #333;
+  padding-top: 15px;
+}
+
+.hint {
+  margin-top: 18px;
+  font-size: 11px;
+  color: #888;
+}
+
+.gameover-box {
+  background: linear-gradient(135deg, #4a148c, #311b92);
+  border-color: #9C27B0;
+  box-shadow: 0 0 40px rgba(156, 39, 176, 0.3);
+}
+
+.gameover-box h1 {
+  color: #E1BEE7;
+}
+
+#gameover-message {
+  font-size: 15px;
+  color: #ccc;
+  margin: 18px 0;
+}
+
+#restart-btn {
+  padding: 14px 30px;
+  font-size: 15px;
+  font-family: 'Courier New', monospace;
+  font-weight: bold;
+  background: #9C27B0;
+  border: none;
+  border-radius: 8px;
+  color: #fff;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+#restart-btn:hover {
+  background: #AB47BC;
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(156, 39, 176, 0.4);
+}
+
+/* 滚动条样式 */
+.lobby-box::-webkit-scrollbar {
+  width: 6px;
+}
+
+.lobby-box::-webkit-scrollbar-track {
+  background: rgba(0,0,0,0.2);
+  border-radius: 3px;
+}
+
+.lobby-box::-webkit-scrollbar-thumb {
+  background: #4CAF50;
+  border-radius: 3px;
+}
