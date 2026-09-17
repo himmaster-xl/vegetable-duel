@@ -121,7 +121,7 @@ export const PLANT_TYPES = {
     cost: 40,
     damage: 30,
     growthTime: 8,
-    speed: 2,
+    speed: 2.5,
     color: '#FAFAFA',
     leafColor: '#558B2F',
     pixelColor: [

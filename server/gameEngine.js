@@ -16,6 +16,20 @@ const INTERACT_RANGE = 70;    // 角色到地块中心允许的最大交互距�
 const ACTION_CD = 220;        // 操作冷却 ms
 const THROW_CD = 400;         // 投掷冷却 ms
 const MAX_POWER = 3;          // 满蓄力速度倍数
+const TILL_IDLE_TIME = 15;    // 翻好的地多久没种就自动变回未耕种（秒）
+const TILL_HOLD_TIME = 0.5;   // 翻地需要长按 E 的秒数
+const COIN_BASE_RATE = 1;     // 基础被动金币（枚/秒）
+const COIN_STAGE_COUNT = 4;   // 金币速度分 4 个阶段
+const COIN_STAGE_BONUS = 0.3; // 每过一个阶段金币速度 +0.3/秒
+
+// 当前被动金币速度：基础速度起步，每过一个阶段 +0.3
+function coinRateAt(elapsed) {
+  const stage = Math.min(
+    COIN_STAGE_COUNT - 1,
+    Math.floor(elapsed / (GAME_DURATION / COIN_STAGE_COUNT))
+  );
+  return COIN_BASE_RATE + stage * COIN_STAGE_BONUS;
+}
 
 // 点到线段的距离（用于高速飞弹的扫掠命中判定）
 function segPointDist(px, py, x0, y0, x1, y1) {
@@ -40,6 +54,7 @@ function createField() {
         watered: false,
         waterTimer: 0,
         mature: false,
+        idleTimer: 0,   // 翻好但没种地的持续时间，超过 TILL_IDLE_TIME 就荒废
       };
     }
   }
@@ -60,6 +75,7 @@ export class GameEngine {
 
     this.projectiles = [];
     this.particles = [];
+    this.bursts = [];     // 玉米连发队列
     this.elapsed = 0;
     this.lastTick = Date.now();
     this.coinAcc = 0;
@@ -83,6 +99,13 @@ export class GameEngine {
       seeds: { carrot: 2, corn: 2, potato: 1 },
       veggies: {},
       charge: 0,          // 蓄力进度 0~1（客户端上报，用于给对手显示蓄力条）
+      dotTimer: 0,        // 辣椒灼烧剩余时间
+      dotDps: 0,          // 灼烧每秒伤害
+      dotAcc: 0,          // 灼烧伤害的小数累加器（保证 HP 是整数）
+      tillHold: 0,        // 长按 E 翻地的进度（秒）
+      tillHoldKey: null,  // 进度对应的地块，换地块要重新计时
+      tillTarget: null,   // 客户端上报的正在按住的地块
+      tillTargetAt: 0,    // 最近一次上报时间（用于判断是否还在按住）
       lastActionAt: 0,
       lastMoveAt: 0,
     };
@@ -115,12 +138,34 @@ export class GameEngine {
     if (dt > 0.1) dt = 0.1;
     this.elapsed += dt;
 
-    // 被动金币：每秒 +1
-    this.coinAcc += dt;
-    if (this.coinAcc >= 1) {
-      this.coinAcc -= 1;
-      this.players.p1.coins += 1;
-      this.players.p2.coins += 1;
+    // 被动金币：分 4 个阶段，每过一个阶段速度 +0.3/秒
+    this.coinAcc += coinRateAt(this.elapsed) * dt;
+    const wholeCoins = Math.floor(this.coinAcc);
+    if (wholeCoins > 0) {
+      this.coinAcc -= wholeCoins;
+      this.players.p1.coins += wholeCoins;
+      this.players.p2.coins += wholeCoins;
+    }
+
+    // 翻好的地太久没种会自己荒废（变回未耕种）
+    for (const p of Object.values(this.players)) {
+      const origin = this.farmOrigin(p.role);
+      for (let r = 0; r < GRID_ROWS; r++) {
+        for (let c = 0; c < GRID_COLS; c++) {
+          const t = p.field[r][c];
+          if (!t.tilled || t.plant) { t.idleTimer = 0; continue; }
+          t.idleTimer = (t.idleTimer || 0) + dt;
+          if (t.idleTimer >= TILL_IDLE_TIME) {
+            t.tilled = false;
+            t.idleTimer = 0;
+            this.spawnParticles(
+              origin.x + c * CELL + CELL / 2,
+              origin.y + r * CELL + CELL / 2,
+              '#8A6B4A', 6
+            );
+          }
+        }
+      }
     }
 
     // 生长（只有浇水后才生长）
@@ -143,29 +188,119 @@ export class GameEngine {
       }
     }
 
+    // 长按 E 翻地：客户端持续上报按住的地块，服务端自己累计时间
+    for (const p of Object.values(this.players)) {
+      const tt = p.tillTarget;
+      const fresh = tt && (now - (p.tillTargetAt || 0)) < 250;
+      if (!fresh) { p.tillHold = 0; p.tillHoldKey = null; continue; }
+      const tile = p.field[tt.row] && p.field[tt.row][tt.col];
+      if (!tile || tile.tilled || !this.nearTile(p, tt.row, tt.col)) {
+        p.tillHold = 0;
+        p.tillHoldKey = null;
+        continue;
+      }
+      // 换到别的地块就重新计时，避免进度跨地块累计
+      const key = `${tt.row},${tt.col}`;
+      if (p.tillHoldKey !== key) { p.tillHoldKey = key; p.tillHold = 0; }
+      p.tillHold += dt;
+      if (p.tillHold >= TILL_HOLD_TIME) {
+        p.tillHold = 0;
+        p.tillHoldKey = null;
+        this.till(p.role, tt.row, tt.col);   // 复用同一套校验与粒子
+      }
+    }
+
+    // 玉米连发队列（按蓄力连发 1~5 枚）
+    for (let i = this.bursts.length - 1; i >= 0; i--) {
+      const b = this.bursts[i];
+      b.timer -= dt;
+      if (b.timer > 0) continue;
+      this.spawnCornShot(b);
+      b.remaining--;
+      b.timer = 0.09;
+      if (b.remaining <= 0) this.bursts.splice(i, 1);
+    }
+
+    // 辣椒灼烧：持续掉血（按整数结算，避免 HP 出现小数）
+    for (const p of Object.values(this.players)) {
+      if (p.dotTimer <= 0) continue;
+      p.dotTimer -= dt;
+      p.dotAcc += p.dotDps * dt;
+      const whole = Math.floor(p.dotAcc);
+      if (whole > 0) {
+        p.dotAcc -= whole;
+        p.hp = Math.max(0, p.hp - whole);
+        this.spawnParticles(p.x, p.y - 16, '#FF7043', 2);
+      }
+      if (p.dotTimer <= 0) {
+        p.dotTimer = 0;
+        p.dotDps = 0;
+        p.dotAcc = 0;
+      }
+    }
+
     // 飞弹
     for (let i = this.projectiles.length - 1; i >= 0; i--) {
       const proj = this.projectiles[i];
-      const nx = proj.x + proj.vx * dt;
-      const ny = proj.y + proj.vy * dt;
       proj.t = (proj.t || 0) + dt;
       proj.life -= dt;
 
+      // 大蒜走正弦蛇形轨迹：位置 = 出生点 + 沿方向推进 + 垂直方向的波偏移
+      let nx, ny;
+      if (proj.sine) {
+        proj.dist += proj.spd * dt;
+        const off = Math.sin(proj.t * Math.PI * 2 * proj.sine.freq) * proj.sine.amp;
+        nx = proj.sx + proj.dx * proj.dist - proj.dy * off;
+        ny = proj.sy + proj.dy * proj.dist + proj.dx * off;
+      } else {
+        nx = proj.x + proj.vx * dt;
+        ny = proj.y + proj.vy * dt;
+      }
+
       const target = this.players[proj.from === 'p1' ? 'p2' : 'p1'];
       // 扫掠判定：蓄力后速度可达 3 倍，一帧位移 30px 左右，逐帧点判定会穿透
+      let playerHit = false;
       const d = segPointDist(target.x, target.y - 14, proj.x, proj.y, nx, ny);
-      if (d < 18) {
-        target.hp = Math.max(0, target.hp - proj.damage);
-        this.spawnParticles(nx, ny - 10, proj.color, 10);
-        this.projectiles.splice(i, 1);
-        continue;
+      if (d < 18 && !proj.hitPlayer) {
+        // 土豆：飞行越久伤害越高（0.35/秒，最多 2 倍）
+        let dmg = proj.damage;
+        if (proj.plantId === 'potato') {
+          dmg = Math.round(proj.damage * Math.min(2, 1 + proj.t * 0.35));
+        }
+        target.hp = Math.max(0, target.hp - dmg);
+
+        // 辣椒：命中玩家后持续灼烧（5 伤害/秒，持续 4 秒）
+        if (proj.plantId === 'pepper') {
+          target.dotTimer = 4;
+          target.dotDps = 5;
+        }
+
+        this.spawnParticles(proj.x, proj.y - 10, proj.color, 10);
+        playerHit = true;
       }
 
       proj.x = nx;
       proj.y = ny;
 
-      // 飞行途中砸到对手地里的作物（每发最多砸掉 1 棵）
-      if (!proj.pierced && this.tryHitCrop(proj, target)) proj.pierced = true;
+      if (playerHit) {
+        if (proj.pierce) {
+          proj.hitPlayer = true;   // 胡萝卜：穿透目标继续飞，但同一个目标只结算一次
+        } else {
+          this.projectiles.splice(i, 1);
+          continue;
+        }
+      }
+
+      // 砸到对手地里的作物：南瓜碾压路径上所有作物，其余每发最多砸 1 棵
+      if (proj.plantId === 'pumpkin' || !proj.pierced) {
+        if (this.tryHitCrop(proj, target)) {
+          if (proj.plantId === 'garlic') {
+            this.projectiles.splice(i, 1);   // 大蒜碰到作物立即消失
+            continue;
+          }
+          if (proj.plantId !== 'pumpkin') proj.pierced = true;
+        }
+      }
 
       if (proj.life <= 0 || proj.x < -20 || proj.x > 660 || proj.y < 8 || proj.y > 322) {
         this.spawnParticles(proj.x, proj.y, proj.color, 5);
@@ -205,7 +340,34 @@ export class GameEngine {
     tile.growth = 0;
     tile.mature = false;
     tile.watered = false;
+    tile.idleTimer = 0;   // 被砸空的地重新开始计算荒废时间
+    // 辣椒烧毁地块：必须重新翻地才能再种
+    if (proj.plantId === 'pepper') tile.tilled = false;
     return true;
+  }
+
+  // 玉米连发：从队列里射出一枚（同方向带一点随机散布）
+  spawnCornShot(b) {
+    const plant = PLANT_TYPES[b.plantId];
+    const spread = (Math.random() - 0.5) * 0.06;
+    const cos = Math.cos(spread), sin = Math.sin(spread);
+    const dx = b.dx * cos - b.dy * sin;
+    const dy = b.dx * sin + b.dy * cos;
+    const speed = plant.speed * 42 * b.power;
+    this.projectiles.push({
+      x: b.x,
+      y: b.y,
+      vx: dx * speed,
+      vy: dy * speed,
+      power: b.power,
+      t: 0,
+      life: 3.5,
+      damage: plant.damage,
+      color: plant.color,
+      plantId: b.plantId,
+      from: b.from,
+      size: 5,
+    });
   }
 
   spawnParticles(x, y, color, count) {
@@ -223,7 +385,7 @@ export class GameEngine {
 
   // ===== 玩家操作 =====
 
-  move(playerId, x, y, facing, charge) {
+  move(playerId, x, y, facing, charge, till) {
     const p = this.players[playerId];
     if (!p || this.state !== 'playing') return { ok: false, reason: '无效' };
     if (typeof x !== 'number' || typeof y !== 'number' ||
@@ -237,6 +399,12 @@ export class GameEngine {
     // 蓄力进度（0~1，仅用于给对手显示蓄力条）
     const c = Number(charge);
     p.charge = isFinite(c) ? clamp(c, 0, 1) : 0;
+    // 长按翻地：客户端随移动一起上报当前按住的地块，null 表示没按
+    const target = till && Number.isInteger(till.row) && Number.isInteger(till.col)
+      ? { row: till.row, col: till.col }
+      : null;
+    p.tillTarget = target;
+    p.tillTargetAt = target ? Date.now() : 0;
     return { ok: true };
   }
 
@@ -278,6 +446,7 @@ export class GameEngine {
     const tile = p.field[row][col];
     if (tile.tilled) return { ok: false, reason: '已经翻过地了' };
     tile.tilled = true;
+    tile.idleTimer = 0;
     this.spawnParticles(
       this.farmOrigin(p.role).x + col * CELL + CELL / 2,
       this.farmOrigin(p.role).y + row * CELL + CELL / 2,
@@ -307,6 +476,7 @@ export class GameEngine {
     tile.maxGrowth = plant.growthTime;
     tile.watered = false;
     tile.mature = false;
+    tile.idleTimer = 0;
     return { ok: true };
   }
 
@@ -343,6 +513,7 @@ export class GameEngine {
     tile.growth = 0;
     tile.mature = false;
     tile.watered = false;
+    tile.idleTimer = 0;   // 收完的地重新开始计算荒废时间
     p.veggies[pid] = (p.veggies[pid] || 0) + 1;
     p.coins += 2;
     return { ok: true, plantId: pid };
@@ -382,11 +553,31 @@ export class GameEngine {
     dx /= len; dy /= len;
 
     const plant = PLANT_TYPES[pid];
-    const speed = plant.speed * 42 * pw;
+    const sx = p.x, sy = p.y - 18;
 
-    this.projectiles.push({
-      x: p.x,
-      y: p.y - 18,
+    // 玉米：按蓄力连发 1~5 枚（蓄满 5 枚），交给连发队列逐枚射出
+    if (pid === 'corn') {
+      const ratio = Math.min(1, (pw - 1) / (MAX_POWER - 1));
+      const shots = 1 + Math.floor(ratio * 4);
+      this.bursts.push({
+        plantId: pid,
+        from: p.role,
+        x: sx, y: sy,
+        dx, dy,
+        power: pw,
+        remaining: shots,
+        timer: 0,
+      });
+      return { ok: true, shots };
+    }
+
+    // 南瓜：滚得慢，蓄力对速度的加成封顶 1.5 倍
+    const speedMul = pid === 'pumpkin' ? Math.min(pw, 1.5) : pw;
+    const speed = plant.speed * 42 * speedMul;
+
+    const proj = {
+      x: sx,
+      y: sy,
       vx: dx * speed,
       vy: dy * speed,
       power: pw,
@@ -396,17 +587,33 @@ export class GameEngine {
       color: plant.color,
       plantId: pid,
       from: p.role,
-      size: pid === 'pumpkin' ? 7 : 5,
-    });
+      size: pid === 'pumpkin' ? 12 : 5,
+    };
+
+    // 胡萝卜：穿透目标继续飞
+    if (pid === 'carrot') proj.pierce = true;
+
+    // 大蒜：正弦蛇形轨迹（碰到作物或玩家都会消失）
+    if (pid === 'garlic') {
+      proj.spd = speed;
+      proj.sx = sx;
+      proj.sy = sy;
+      proj.dx = dx;
+      proj.dy = dy;
+      proj.dist = 0;
+      proj.sine = { amp: 26, freq: 2.2 };
+    }
+
+    this.projectiles.push(proj);
     return { ok: true };
   }
 
   // 统一入口
   action(playerRole, action, params) {
     switch (action) {
-      case 'move': return this.move(playerRole, params.x, params.y, params.facing, params.charge);
+      case 'move': return this.move(playerRole, params.x, params.y, params.facing, params.charge, params.till);
       case 'buy': return this.buySeed(playerRole, params.plantId);
-      case 'till': return this.till(playerRole, params.row, params.col);
+      case 'till': return { ok: false, reason: '翻地需要长按 E' };
       case 'plant': return this.plant(playerRole, params.row, params.col, params.plantId);
       case 'water': return this.water(playerRole, params.row, params.col);
       case 'harvest': return this.harvest(playerRole, params.row, params.col);
@@ -438,6 +645,9 @@ export class GameEngine {
       seeds: p.seeds,
       veggies: p.veggies,
       charge: Math.round((p.charge || 0) * 100) / 100,
+      dot: Math.round((p.dotTimer || 0) * 10) / 10,
+      tillHold: Math.round((p.tillHold || 0) * 100) / 100,
+      tillTarget: p.tillTarget || null,
     });
 
     return {

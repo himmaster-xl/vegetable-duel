@@ -4,6 +4,10 @@
 // 完全独立，无外部依赖
 // ============================================
 
+import { audio } from './audio.js?v=1';
+
+audio.installUnlock();
+
 const CANVAS_W = 640;
 const CANVAS_H = 360;
 const HUD_H = 28;       // 顶部状态栏高度
@@ -16,7 +20,7 @@ const PLANT_TYPES = {
   pepper:   { id:'pepper',   name:'辣椒',   cost:30, damage:15, growthTime:6, speed:3, chargeTime:0.8, color:'#E53935', leafColor:'#2E7D32' },
   corn:     { id:'corn',     name:'玉米',   cost:12, damage:8,  growthTime:4, speed:6, chargeTime:1.0, color:'#FDD835', leafColor:'#388E3C' },
   pumpkin:  { id:'pumpkin',  name:'南瓜',   cost:15, damage:5,  growthTime:7, speed:2, chargeTime:1.3, color:'#F57C00', leafColor:'#1B5E20' },
-  garlic:   { id:'garlic',   name:'大蒜',   cost:40, damage:30, growthTime:8, speed:2, chargeTime:1.5, color:'#FAFAFA', leafColor:'#558B2F' },
+  garlic:   { id:'garlic',   name:'大蒜',   cost:40, damage:30, growthTime:8, speed:2.5, chargeTime:1.5, color:'#FAFAFA', leafColor:'#558B2F' },
 };
 const MAX_POWER = 3;         // 满蓄力时速度倍数
 const CHARGE_DECAY_TIME = 1.5; // 松手后从满蓄力衰减到 0 需要的时间（秒）
@@ -35,8 +39,25 @@ const WALK_P1 = { minX: 24, maxX: 304, minY: 52, maxY: 288 };
 const WALK_P2 = { minX: 336, maxX: 616, minY: 52, maxY: 288 };
 const PLAYER_SPEED = 100;
 const AI_SPEED = 78;
-const REACH = 30;          // 面朝方向的交互距离
 const WATER_DURATION = 6;  // 一次浇水可维持的生长时间（秒）
+const TILL_IDLE_TIME = 15; // 翻好的地多久没种就荒废回未耕种（秒）
+const TILL_HOLD_TIME = 0.5; // 翻地需要长按 E 的秒数
+
+// ===== 被动金币：4 个阶段，每过一个阶段速度 +0.3/秒 =====
+const COIN_BASE_RATE = 1;     // 基础速度（枚/秒）
+const COIN_STAGE_COUNT = 4;
+const COIN_STAGE_BONUS = 0.3;
+
+function coinStageAt(elapsed) {
+  return Math.min(
+    COIN_STAGE_COUNT - 1,
+    Math.floor(elapsed / (GAME_DURATION / COIN_STAGE_COUNT))
+  );
+}
+
+function coinRateAt(elapsed) {
+  return COIN_BASE_RATE + coinStageAt(elapsed) * COIN_STAGE_BONUS;
+}
 
 // ===== 蔬菜像素美术 =====
 // 字符 → 调色板：L/l 叶（深/浅）、O 主体、o 暗部、h 亮部、S 蒂/秆、k 玉米粒、W 玉米须、T 花、G 蒜苔珠
@@ -349,6 +370,7 @@ function createField() {
         watered: false,    // 当前是否湿润
         waterTimer: 0,     // 湿润剩余时间
         mature: false,     // 是否成熟
+        idleTimer: 0,      // 翻好但没种地的持续时间，超过 TILL_IDLE_TIME 就荒废
       };
     }
   }
@@ -379,6 +401,11 @@ function createFarmer(role, name, farmOrigin, walk) {
     interactCd: 0,
     throwCd: 0,
     hitFlash: 0,
+    dotTimer: 0,           // 辣椒灼烧剩余时间
+    dotDps: 0,             // 灼烧每秒伤害
+    dotAcc: 0,             // 灼烧小数累加器（保证 HP 是整数）
+    tillHold: 0,           // 长按 E 翻地的进度（秒）
+    tillTileKey: null,     // 进度对应的地块，换地块要重新计时
   };
 }
 
@@ -391,6 +418,8 @@ class AI {
     this.throwCd = 4;
     this.chargeGoal = 0;    // >0 表示正在蓄力，达到该秒数后出手
     this.pendingVeggie = null;
+    this.tillHold = 0;      // 长按翻地进度
+    this.tillTileKey = null;
   }
 
   update(dt) {
@@ -488,8 +517,18 @@ class AI {
     // 到达，执行
     p2.moving = false;
     const tile = p2.farm[t.r][t.c];
+    if (t.type !== 'till') { this.tillHold = 0; this.tillTileKey = null; }
     if (t.type === 'till' && !tile.tilled) {
+      // 翻地同样要长按，和玩家规则一致；换地块则重新计时
+      const key = `${t.r},${t.c}`;
+      if (this.tillTileKey !== key) { this.tillTileKey = key; this.tillHold = 0; }
+      this.tillHold += dt;
+      if (this.tillHold < TILL_HOLD_TIME) return;   // 站在地里翻，进度保留
+      this.tillHold = 0;
+      this.tillTileKey = null;
       tile.tilled = true;
+      tile.idleTimer = 0;
+      audio.sfx('till', 0.45);
     } else if (t.type === 'plant') {
       let seed = PLANT_ORDER.find(p => (p2.seeds[p] || 0) > 0);
       if (!seed) {
@@ -509,16 +548,21 @@ class AI {
         tile.maxGrowth = PLANT_TYPES[seed].growthTime;
         tile.watered = false;
         tile.mature = false;
+        tile.idleTimer = 0;
+        audio.sfx('plant', 0.4);
       }
     } else if (t.type === 'water' && !tile.watered && !tile.mature) {
       tile.watered = true;
       tile.waterTimer = WATER_DURATION;
+      audio.sfx('water', 0.35);
     } else if (t.type === 'harvest' && tile.mature) {
       const pid = tile.plant;
       tile.plant = null; tile.growth = 0; tile.mature = false; tile.watered = false;
+      tile.idleTimer = 0;
       p2.veggies[pid] = (p2.veggies[pid] || 0) + 1;
       p2.coins += 2;
       this.game.spawnParticles(tx, ty, PLANT_TYPES[pid].color, 6);
+      audio.sfx('harvest', 0.4);
     }
     this.task = null;
     this.decisionCd = 0.35;
@@ -544,6 +588,7 @@ export class SinglePlayerGame {
 
     this.projectiles = [];
     this.particles = [];
+    this.bursts = [];     // 玉米连发队列
     this.toasts = [];
     this.keys = {};
     this.mouse = { x: this.p1.x + 220, y: this.p1.y - 10 };  // 最近一次鼠标位置（左键瞄准用）
@@ -556,6 +601,7 @@ export class SinglePlayerGame {
     this.shake = 0;
     this.targetTile = null;
     this.ai = new AI(this);
+    this.audio = audio;   // 方便控制台调试与测试
 
     console.log('SinglePlayerGame initialized (Stardew style)');
   }
@@ -563,7 +609,8 @@ export class SinglePlayerGame {
   // ===== 生命周期 =====
   start() {
     this.lastTime = performance.now();
-    this.toast('WASD 移动 | E 交互地块 | 长按空格蓄力 + 左键投掷 | 1-6 选择种子', '#FFD700');
+    this.toast('WASD 移动 | E 交互地块 | 长按空格蓄力 + 左键投掷 | 1-6 选择种子 | M 静音', '#FFD700');
+    audio.startMusic();
     this.loop();
     console.log('Game loop started');
   }
@@ -585,6 +632,7 @@ export class SinglePlayerGame {
     this.ended = true;
     if (this.rafId) cancelAnimationFrame(this.rafId);
     this.rafId = null;
+    audio.stopMusic();
   }
 
   // ===== 更新 =====
@@ -595,15 +643,19 @@ export class SinglePlayerGame {
     this.updatePlayer(dt);
     this.ai.update(dt);
     this.updateGrowth(dt);
+    this.updateTilledIdle(dt);
+    this.updateBursts(dt);
+    this.updateDot(dt);
     this.updateProjectiles(dt);
     this.updateParticles(dt);
 
-    // 被动金币
-    this.coinTimer += dt;
-    if (this.coinTimer >= 1) {
-      this.coinTimer -= 1;
-      this.p1.coins += 1;
-      this.p2.coins += 1;
+    // 被动金币：分 4 个阶段，每过一个阶段速度 +0.3/秒
+    this.coinTimer += coinRateAt(this.elapsed) * dt;
+    const wholeCoins = Math.floor(this.coinTimer);
+    if (wholeCoins > 0) {
+      this.coinTimer -= wholeCoins;
+      this.p1.coins += wholeCoins;
+      this.p2.coins += wholeCoins;
     }
 
     // 提示文本
@@ -614,6 +666,9 @@ export class SinglePlayerGame {
 
     // 交互目标高亮
     this.targetTile = this.getTargetTile(this.p1);
+
+    // 长按 E 翻地
+    this.updateTillHold(dt);
 
     // 蓄力：按住空格增加，松手后衰减（不同蔬菜蓄力时间不同）
     const selPlant = PLANT_TYPES[this.p1.selected];
@@ -683,26 +738,113 @@ export class SinglePlayerGame {
     }
   }
 
+  // 翻地需要长按 E（松开或换地块都会重新计时）
+  updateTillHold(dt) {
+    const p = this.p1;
+    const target = this.targetTile;
+    const tile = target ? p.farm[target.r][target.c] : null;
+    const holding = this.keys['e'] && tile && !tile.tilled && p.interactCd <= 0;
+    if (!holding) {
+      p.tillHold = 0;
+      p.tillTileKey = null;
+      return;
+    }
+
+    // 踩着的地块变了就重新计时，避免进度跨地块累计
+    const key = `${target.r},${target.c}`;
+    if (p.tillTileKey !== key) { p.tillTileKey = key; p.tillHold = 0; }
+
+    p.tillHold += dt;
+    if (p.tillHold < TILL_HOLD_TIME) return;
+
+    p.tillHold = 0;
+    p.tillTileKey = null;
+    p.interactCd = 0.25;
+    tile.tilled = true;
+    tile.idleTimer = 0;
+    this.spawnParticles(
+      p.farmX + target.c * CELL + CELL / 2,
+      p.farmY + target.r * CELL + CELL / 2,
+      '#8A6B4A', 8
+    );
+    audio.sfx('till');
+    this.toast('🪓 翻地完成', '#D7B377');
+  }
+
+  // 翻好的地太久没种会自己荒废（变回未耕种）
+  updateTilledIdle(dt) {
+    for (const farmer of [this.p1, this.p2]) {
+      for (let r = 0; r < FARM_ROWS; r++) {
+        for (let c = 0; c < FARM_COLS; c++) {
+          const t = farmer.farm[r][c];
+          if (!t.tilled || t.plant) { t.idleTimer = 0; continue; }
+          t.idleTimer = (t.idleTimer || 0) + dt;
+          if (t.idleTimer >= TILL_IDLE_TIME) {
+            t.tilled = false;
+            t.idleTimer = 0;
+            audio.sfx('revert', 0.7);
+            this.spawnParticles(
+              farmer.farmX + c * CELL + CELL / 2,
+              farmer.farmY + r * CELL + CELL / 2,
+              '#8A6B4A', 6
+            );
+          }
+        }
+      }
+    }
+  }
+
   updateProjectiles(dt) {
     for (let i = this.projectiles.length - 1; i >= 0; i--) {
       const p = this.projectiles[i];
-      p.x += p.vx * dt;
-      p.y += p.vy * dt;
+      const px = p.x, py = p.y;
       p.t += dt;
       p.life -= dt;
+
+      // 大蒜走正弦蛇形轨迹：位置 = 出生点 + 沿方向推进 + 垂直方向的波偏移
+      let nx, ny;
+      if (p.sine) {
+        p.dist += p.spd * dt;
+        const off = Math.sin(p.t * Math.PI * 2 * p.sine.freq) * p.sine.amp;
+        nx = p.sx + p.dx * p.dist - p.dy * off;
+        ny = p.sy + p.dy * p.dist + p.dx * off;
+      } else {
+        nx = p.x + p.vx * dt;
+        ny = p.y + p.vy * dt;
+      }
 
       const target = p.from === 'p1' ? this.p2 : this.p1;
 
       // 命中角色（扫掠检测：蓄力后速度很快，逐帧点判定会穿透）
-      const d = segPointDist(target.x, target.y - 14, p.x - p.vx * dt, p.y - p.vy * dt, p.x, p.y);
-      if (d < 16) {
+      let playerHit = false;
+      const d = segPointDist(target.x, target.y - 14, px, py, nx, ny);
+      if (d < 16 && !p.hitPlayer) {
         this.handleHit(p, target);
-        this.projectiles.splice(i, 1);
-        continue;
+        playerHit = true;
       }
 
-      // 飞行途中砸到对手地里的作物（每发最多砸掉 1 棵）
-      if (!p.pierced && this.tryHitCrop(p, target)) p.pierced = true;
+      p.x = nx;
+      p.y = ny;
+
+      if (playerHit) {
+        if (p.pierce) {
+          p.hitPlayer = true;   // 胡萝卜：穿透目标继续飞，但同一个目标只结算一次
+        } else {
+          this.projectiles.splice(i, 1);
+          continue;
+        }
+      }
+
+      // 砸到对手地里的作物：南瓜碾压路径上所有作物，其余每发最多砸 1 棵
+      if (p.plantId === 'pumpkin' || !p.pierced) {
+        if (this.tryHitCrop(p, target)) {
+          if (p.plantId === 'garlic') {
+            this.projectiles.splice(i, 1);   // 大蒜碰到作物立即消失
+            continue;
+          }
+          if (p.plantId !== 'pumpkin') p.pierced = true;
+        }
+      }
 
       // 飞出 / 落地
       if (p.life <= 0 || p.x < -20 || p.x > CANVAS_W + 20 || p.y < HUD_H - 20 || p.y > SHOP_Y + 20) {
@@ -712,12 +854,80 @@ export class SinglePlayerGame {
     }
   }
 
+  // 玉米连发队列：按蓄力逐枚射出（蓄满 5 枚）
+  updateBursts(dt) {
+    for (let i = this.bursts.length - 1; i >= 0; i--) {
+      const b = this.bursts[i];
+      b.timer -= dt;
+      if (b.timer > 0) continue;
+      this.spawnCornShot(b);
+      b.remaining--;
+      b.timer = 0.09;
+      if (b.remaining <= 0) this.bursts.splice(i, 1);
+    }
+  }
+
+  spawnCornShot(b) {
+    const plant = PLANT_TYPES[b.plantId];
+    const spread = (Math.random() - 0.5) * 0.06;
+    const cos = Math.cos(spread), sin = Math.sin(spread);
+    const dx = b.dx * cos - b.dy * sin;
+    const dy = b.dx * sin + b.dy * cos;
+    const speed = plant.speed * 42 * b.power;
+    this.projectiles.push({
+      x: b.x,
+      y: b.y,
+      vx: dx * speed,
+      vy: dy * speed,
+      power: b.power,
+      t: 0,
+      life: 3.5,
+      damage: plant.damage,
+      color: plant.color,
+      plantId: b.plantId,
+      from: b.from,
+      size: 5,
+    });
+  }
+
+  // 辣椒灼烧：持续掉血（整数结算，避免 HP 出现小数）
+  updateDot(dt) {
+    for (const p of [this.p1, this.p2]) {
+      if (p.dotTimer <= 0) continue;
+      p.dotTimer -= dt;
+      p.dotAcc += p.dotDps * dt;
+      const whole = Math.floor(p.dotAcc);
+      if (whole > 0) {
+        p.dotAcc -= whole;
+        p.hp = Math.max(0, p.hp - whole);
+        this.spawnParticles(p.x, p.y - 16, '#FF7043', 2);
+      }
+      p.hitFlash = Math.max(p.hitFlash, 0.1);   // 灼烧期间持续红闪
+      if (p.dotTimer <= 0) {
+        p.dotTimer = 0;
+        p.dotDps = 0;
+        p.dotAcc = 0;
+      }
+    }
+  }
+
   handleHit(proj, target) {
-    target.hp = Math.max(0, target.hp - proj.damage);
+    // 土豆：飞行越久伤害越高（0.35/秒，最多 2 倍）
+    let dmg = proj.damage;
+    if (proj.plantId === 'potato') dmg = Math.round(proj.damage * Math.min(2, 1 + proj.t * 0.35));
+    target.hp = Math.max(0, target.hp - dmg);
     target.hitFlash = 0.3;
+    audio.sfx(target.role === 'p1' ? 'hurt' : 'hit');
+
+    // 辣椒：命中后持续灼烧（5 伤害/秒，持续 4 秒）
+    if (proj.plantId === 'pepper') {
+      target.dotTimer = 4;
+      target.dotDps = 5;
+    }
+
     this.spawnParticles(proj.x, proj.y - 10, proj.color, 10);
     this.shake = 0.15;
-    this.toast(`${target.role === 'p1' ? '你' : '对手'}受到 ${proj.damage} 伤害！`, '#FF8A80');
+    this.toast(`${target.role === 'p1' ? '你' : '对手'}受到 ${dmg} 伤害！`, '#FF8A80');
   }
 
   // 飞过对手地块时砸掉作物（自己的地不会被自己的蔬菜砸坏）
@@ -733,7 +943,11 @@ export class SinglePlayerGame {
     tile.growth = 0;
     tile.mature = false;
     tile.watered = false;
+    tile.idleTimer = 0;   // 被砸空的地重新开始计算荒废时间
+    // 辣椒烧毁地块：必须重新翻地才能再种
+    if (proj.plantId === 'pepper') tile.tilled = false;
     this.spawnParticles(proj.x, proj.y, PLANT_TYPES[pid].color, 8);
+    audio.sfx('smash');
     this.toast(`摧毁了对手的${PLANT_TYPES[pid].name}！`, '#81C784');
     return true;
   }
@@ -771,20 +985,10 @@ export class SinglePlayerGame {
   }
 
   // ===== 交互 =====
+  // 交互目标就是角色脚下踩着的那块地
   getTargetTile(farmer) {
-    let tx = farmer.x, ty = farmer.y - 12;
-    if (farmer.facing === 'up') ty -= REACH;
-    else if (farmer.facing === 'down') ty += REACH;
-    else if (farmer.facing === 'left') tx -= REACH;
-    else tx += REACH;
-
-    let col = Math.floor((tx - farmer.farmX) / CELL);
-    let row = Math.floor((ty - farmer.farmY) / CELL);
-    if (row >= 0 && row < FARM_ROWS && col >= 0 && col < FARM_COLS) return { r: row, c: col };
-
-    // 兜底：脚下地块
-    col = Math.floor((farmer.x - farmer.farmX) / CELL);
-    row = Math.floor((farmer.y - farmer.farmY) / CELL);
+    const col = Math.floor((farmer.x - farmer.farmX) / CELL);
+    const row = Math.floor((farmer.y - farmer.farmY) / CELL);
     if (row >= 0 && row < FARM_ROWS && col >= 0 && col < FARM_COLS) return { r: row, c: col };
     return null;
   }
@@ -802,7 +1006,7 @@ export class SinglePlayerGame {
     if (p.interactCd > 0) return;
     const target = this.targetTile;
     if (!target) {
-      this.toast('走到自家农田旁，面朝地块按 E', '#FFD700');
+      this.toast('站到自家农田的地块上按 E', '#FFD700');
       return;
     }
     const tile = p.farm[target.r][target.c];
@@ -810,10 +1014,7 @@ export class SinglePlayerGame {
     const ty = p.farmY + target.r * CELL + CELL / 2;
 
     if (!tile.tilled) {
-      tile.tilled = true;
-      p.interactCd = 0.25;
-      this.spawnParticles(tx, ty, '#8A6B4A', 8);
-      this.toast('🪓 翻地完成', '#D7B377');
+      this.toast('长按 E 翻地', '#D7B377');
     } else if (!tile.plant) {
       const pid = p.selected;
       if ((p.seeds[pid] || 0) > 0) {
@@ -823,10 +1024,13 @@ export class SinglePlayerGame {
         tile.maxGrowth = PLANT_TYPES[pid].growthTime;
         tile.watered = false;
         tile.mature = false;
+        tile.idleTimer = 0;
         p.interactCd = 0.25;
         this.spawnParticles(tx, ty, '#8BC34A', 6);
+        audio.sfx('plant');
         this.toast(`🌱 种下${PLANT_TYPES[pid].name}（按 E 浇水）`, '#8BC34A');
       } else {
+        audio.sfx('deny');
         this.toast(`没有${PLANT_TYPES[pid].name}种子，点下方按钮购买`, '#FF8A80');
       }
     } else if (tile.mature) {
@@ -835,16 +1039,19 @@ export class SinglePlayerGame {
       tile.growth = 0;
       tile.mature = false;
       tile.watered = false;
+      tile.idleTimer = 0;   // 收完的地重新开始计算荒废时间
       p.veggies[pid] = (p.veggies[pid] || 0) + 1;
       p.coins += 2;
       p.interactCd = 0.25;
       this.spawnParticles(tx, ty, PLANT_TYPES[pid].color, 10);
+      audio.sfx('harvest');
       this.toast(`🥕 收获${PLANT_TYPES[pid].name}！左键投掷`, PLANT_TYPES[pid].color);
     } else if (!tile.watered) {
       tile.watered = true;
       tile.waterTimer = WATER_DURATION;
       p.interactCd = 0.25;
       this.spawnParticles(tx, ty, '#64B5F6', 8);
+      audio.sfx('water');
       this.toast('💧 浇水完成', '#64B5F6');
     } else {
       this.toast('作物正在生长中...', '#AAA');
@@ -878,16 +1085,38 @@ export class SinglePlayerGame {
     const d = dir || this.getAimDir(farmer);
     const len = Math.hypot(d.x, d.y) || 1;
     const dx = d.x / len, dy = d.y / len;
-    const speed = plant.speed * 42 * power;
 
     farmer.charge = 0;
     farmer.charging = false;
     farmer.aim = { x: dx, y: dy };
     farmer.facing = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
 
-    this.projectiles.push({
-      x: farmer.x,
-      y: farmer.y - 18,
+    const sx = farmer.x, sy = farmer.y - 18;
+
+    // 玉米：按蓄力连发 1~5 枚（蓄满 5 枚），交给连发队列逐枚射出
+    if (plantId === 'corn') {
+      const shots = 1 + Math.floor(ratio * 4);
+      this.bursts.push({
+        plantId,
+        from: farmer.role,
+        x: sx, y: sy,
+        dx, dy,
+        power,
+        remaining: shots,
+        timer: 0,
+      });
+      this.spawnParticles(sx, sy, plant.color, 4);
+      audio.sfx('throw');
+      return;
+    }
+
+    // 南瓜：滚得慢，蓄力对速度的加成封顶 1.5 倍
+    const speedMul = plantId === 'pumpkin' ? Math.min(power, 1.5) : power;
+    const speed = plant.speed * 42 * speedMul;
+
+    const proj = {
+      x: sx,
+      y: sy,
       vx: dx * speed,
       vy: dy * speed,
       power,
@@ -897,10 +1126,27 @@ export class SinglePlayerGame {
       color: plant.color,
       plantId,
       from: farmer.role,
-      size: plantId === 'pumpkin' ? 7 : 5,
-    });
+      size: plantId === 'pumpkin' ? 12 : 5,
+    };
 
-    this.spawnParticles(farmer.x, farmer.y - 18, plant.color, 4);
+    // 胡萝卜：穿透目标继续飞
+    if (plantId === 'carrot') proj.pierce = true;
+
+    // 大蒜：正弦蛇形轨迹（碰到作物或玩家都会消失）
+    if (plantId === 'garlic') {
+      proj.spd = speed;
+      proj.sx = sx;
+      proj.sy = sy;
+      proj.dx = dx;
+      proj.dy = dy;
+      proj.dist = 0;
+      proj.sine = { amp: 26, freq: 2.2 };
+    }
+
+    this.projectiles.push(proj);
+
+    this.spawnParticles(sx, sy, plant.color, 4);
+    audio.sfx('throw');
   }
 
   // 朝鼠标点击位置投掷（左键）
@@ -934,8 +1180,10 @@ export class SinglePlayerGame {
     if (p.coins >= plant.cost) {
       p.coins -= plant.cost;
       p.seeds[pid] = (p.seeds[pid] || 0) + 1;
+      audio.sfx('buy');
       this.toast(`购买了${plant.name}种子（💰${plant.cost}）`, '#FFD700');
     } else {
+      audio.sfx('deny');
       this.toast('金币不足！', '#FF8A80');
     }
   }
@@ -954,10 +1202,16 @@ export class SinglePlayerGame {
 
   // ===== 键盘 =====
   handleKey(k) {
+    if (k === 'm') {
+      const muted = audio.toggleMute();
+      this.toast(muted ? '🔇 已静音' : '🔊 音乐已开启', '#FFD700');
+      return;
+    }
     if (this.ended) return;
     if (k >= '1' && k <= '6') {
       const pid = PLANT_ORDER[parseInt(k) - 1];
       this.p1.selected = pid;
+      audio.sfx('click');
       this.toast(`选中 ${PLANT_TYPES[pid].name}`, PLANT_TYPES[pid].color);
       return;
     }
@@ -982,6 +1236,7 @@ export class SinglePlayerGame {
       goMsg.textContent = `剩余 HP — 你: ${this.p1.hp} / 对手: ${this.p2.hp}　|　收获蔬菜: ${this.countVeggies(this.p1)} 个`;
     }
     if (goOverlay) goOverlay.style.display = 'flex';
+    audio.sfx(p1Won ? 'win' : 'lose');
     console.log('Game ended, winner:', p1Won ? 'p1' : 'p2');
   }
 
@@ -1046,6 +1301,19 @@ export class SinglePlayerGame {
         const tt = !tile.tilled ? tileTex.untilled : (tile.watered ? tileTex.watered : tileTex.tilled);
         ctx.drawImage(tt, x + 1, y + 1);
 
+        // 翻好但一直没种：快到荒废时间时闪褐色警示
+        if (tile.tilled && !tile.plant) {
+          const idle = tile.idleTimer || 0;
+          if (idle > TILL_IDLE_TIME * 0.6) {
+            const pulse = 0.5 + Math.sin(performance.now() / 140) * 0.5;
+            ctx.fillStyle = `rgba(90,60,25,${0.18 + pulse * 0.22})`;
+            ctx.fillRect(x + 1, y + 1, CELL - 2, CELL - 2);
+            ctx.fillStyle = `rgba(255,190,90,${0.55 + pulse * 0.45})`;
+            ctx.font = 'bold 9px monospace';
+            ctx.fillText('⌛', x + 3, y + 12);
+          }
+        }
+
         // 作物
         if (tile.plant) {
           const prog = tile.maxGrowth > 0 ? tile.growth / tile.maxGrowth : 0;
@@ -1093,7 +1361,7 @@ export class SinglePlayerGame {
 
     const action = this.tileAction(tile);
     if (action) {
-      const label = `E ${action}`;
+      const label = (tile.tilled ? 'E ' : '长按E ') + action;
       ctx.font = 'bold 9px monospace';
       const tw = ctx.measureText(label).width + 8;
       const bx = x + CELL / 2 - tw / 2;
@@ -1105,6 +1373,17 @@ export class SinglePlayerGame {
       ctx.strokeRect(bx, by, tw, 13);
       ctx.fillStyle = '#FFD700';
       ctx.fillText(label, bx + 4, by + 10);
+    }
+
+    // 长按翻地的进度条
+    if (!tile.tilled && this.p1.tillHold > 0) {
+      const prog = Math.min(1, this.p1.tillHold / TILL_HOLD_TIME);
+      const bw = CELL - 8, bh = 5;
+      const bx = x + 4, by = y + CELL - 10;
+      ctx.fillStyle = 'rgba(0,0,0,0.65)';
+      ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
+      ctx.fillStyle = '#D7B377';
+      ctx.fillRect(bx, by, bw * prog, bh);
     }
   }
 
@@ -1286,15 +1565,20 @@ export class SinglePlayerGame {
   drawProjectiles(ctx) {
     for (const p of this.projectiles) {
       const bob = Math.sin(p.t * 12) * 1.5;
-      // 地面阴影
+      // 土豆：飞行越久涨得越大（1 倍 → 2 倍）；南瓜：巨型滚动弹
+      const scale = p.plantId === 'potato' ? Math.min(2, 1 + p.t * 0.35)
+                  : p.plantId === 'pumpkin' ? 2 : 1;
+      const w = 18 * scale, h = 18 * scale;
+      // 地面阴影（南瓜的 size 本身就更大）
+      const shScale = p.plantId === 'potato' ? scale : 1;
       ctx.fillStyle = 'rgba(0,0,0,0.2)';
       ctx.beginPath();
-      ctx.ellipse(p.x, p.y + 10, p.size * 0.8, p.size * 0.4, 0, 0, Math.PI * 2);
+      ctx.ellipse(p.x, p.y + 10, (p.size * 0.8) * shScale, (p.size * 0.4) * shScale, 0, 0, Math.PI * 2);
       ctx.fill();
       // 蔬菜本体（用成熟形态的像素图，飞出去也认得出是什么菜）
       const tex = itemTextures[p.plantId];
       if (tex) {
-        ctx.drawImage(tex, Math.round(p.x - 9), Math.round(p.y - 15 + bob), 18, 18);
+        ctx.drawImage(tex, Math.round(p.x - w / 2), Math.round(p.y - 15 + bob - (h - 18) / 2), w, h);
       }
     }
   }
@@ -1329,6 +1613,17 @@ export class SinglePlayerGame {
     ctx.textAlign = 'center';
     ctx.fillText(`${m}:${s.toString().padStart(2, '0')}`, CANVAS_W / 2, 19);
     ctx.textAlign = 'start';
+
+    // 金币阶段提示（每过一个阶段被动金币 +0.3/秒）
+    const stage = coinStageAt(this.elapsed) + 1;
+    const rate = coinRateAt(this.elapsed);
+    ctx.fillStyle = '#FFD54F';
+    ctx.font = '8px monospace';
+    ctx.fillText(`阶段 ${stage}/${COIN_STAGE_COUNT} · 金币 +${rate.toFixed(1)}/秒`, CANVAS_W / 2 + 34, 19);
+
+    // 静音状态（M 键切换）
+    ctx.font = '10px monospace';
+    ctx.fillText(audio.isMuted() ? '\u{1F507}' : '\u{1F50A}', CANVAS_W - 8 - 120 - 18, 19);
   }
 
   drawHPBar(ctx, x, y, farmer, alignRight) {

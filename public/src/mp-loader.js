@@ -3,7 +3,7 @@
 // 仅在用户选择联机时加载
 // ============================================
 
-import { MPGame } from './mp-game.js';
+import { MPGame } from './mp-game.js?v=8';
 
 const lobbyOverlay = document.getElementById('lobby-overlay');
 const waitingOverlay = document.getElementById('waiting-overlay');

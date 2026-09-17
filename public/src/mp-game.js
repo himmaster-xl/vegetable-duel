@@ -5,6 +5,9 @@
 // ============================================
 
 import { Network } from './network.js';
+import { audio } from './audio.js?v=1';
+
+audio.installUnlock();
 
 const CANVAS_W = 640;
 const CANVAS_H = 360;
@@ -17,7 +20,7 @@ const PLANT_TYPES = {
   pepper:   { id:'pepper',   name:'辣椒',   cost:30, damage:15, growthTime:6, speed:3, chargeTime:0.8, color:'#E53935', leafColor:'#2E7D32' },
   corn:     { id:'corn',     name:'玉米',   cost:12, damage:8,  growthTime:4, speed:6, chargeTime:1.0, color:'#FDD835', leafColor:'#388E3C' },
   pumpkin:  { id:'pumpkin',  name:'南瓜',   cost:15, damage:5,  growthTime:7, speed:2, chargeTime:1.3, color:'#F57C00', leafColor:'#1B5E20' },
-  garlic:   { id:'garlic',   name:'大蒜',   cost:40, damage:30, growthTime:8, speed:2, chargeTime:1.5, color:'#FAFAFA', leafColor:'#558B2F' },
+  garlic:   { id:'garlic',   name:'大蒜',   cost:40, damage:30, growthTime:8, speed:2.5, chargeTime:1.5, color:'#FAFAFA', leafColor:'#558B2F' },
 };
 const MAX_POWER = 3;           // 满蓄力时速度倍数
 const CHARGE_DECAY_TIME = 1.5; // 松手后从满蓄力衰减到 0 需要的时间（秒）
@@ -35,8 +38,38 @@ const WALKS = {
   p2: { minX: 336, maxX: 616, minY: 52, maxY: 288 },
 };
 const PLAYER_SPEED = 100;
-const REACH = 30;
 const MOVE_SEND_INTERVAL = 60; // ms
+const TILL_IDLE_TIME = 15;     // 翻好的地多久没种就荒废回未耕种（秒）
+const TILL_HOLD_TIME = 0.5;    // 翻地需要长按 E 的秒数（与服务端一致，用于画进度条）
+
+// ===== 被动金币：4 个阶段，每过一个阶段速度 +0.3/秒（与服务端一致） =====
+const COIN_BASE_RATE = 1;
+const COIN_STAGE_COUNT = 4;
+const COIN_STAGE_BONUS = 0.3;
+
+function coinStageAt(elapsed) {
+  return Math.min(
+    COIN_STAGE_COUNT - 1,
+    Math.floor(elapsed / (GAME_DURATION / COIN_STAGE_COUNT))
+  );
+}
+
+function coinRateAt(elapsed) {
+  return COIN_BASE_RATE + coinStageAt(elapsed) * COIN_STAGE_BONUS;
+}
+
+// 统计地块状态，用于从服务端快照的变化推断音效
+function countTilled(field) {
+  let n = 0;
+  for (const row of field) for (const t of row) if (t.tilled) n++;
+  return n;
+}
+
+function countCrops(field) {
+  let n = 0;
+  for (const row of field) for (const t of row) if (t.plant) n++;
+  return n;
+}
 
 // ===== 蔬菜像素美术 =====
 // 字符 → 调色板：L/l 叶（深/浅）、O 主体、o 暗部、h 亮部、S 蒂/秆、k 玉米粒、W 玉米须、T 花、G 蒜苔珠
@@ -350,12 +383,15 @@ export class MPGame {
     this.lastMoveSent = 0;
     this.throwCd = 0;
     this.interactCd = 0;
+    this.pendingDmg = 0;    // 待提示的累计受伤（灼烧节流用）
+    this.dmgToastAt = 0;
     this.ended = false;
     this.rafId = null;
     this.lastTime = 0;
     this.gameOverShown = false;
 
-    this.onReady = null;   // 状态进入 playing 时回调
+    this.onReady = null;
+    this.audio = audio;   // 方便控制台调试与测试   // 状态进入 playing 时回调
   }
 
   async start(playerName, roomId = null) {
@@ -383,14 +419,35 @@ export class MPGame {
       this.state = msg.state;
       const me = this.role ? msg.state.players[this.role] : null;
       if (prevMe && me && me.hp < prevMe.hp) {
-        this.toast(`你受到 ${prevMe.hp - me.hp} 伤害！`, '#FF8A80');
+        // 辣椒灼烧会持续掉血，先攒着，按节流统一提示，避免每帧刷屏
+        this.pendingDmg = (this.pendingDmg || 0) + (prevMe.hp - me.hp);
+        this.playHurtSfx();
       }
+      // 对手掉血 -> 命中音
+      const oppNow = this.role ? msg.state.players[this.role === 'p1' ? 'p2' : 'p1'] : null;
+      if (oppNow && this.prevOppHp !== undefined && oppNow.hp < this.prevOppHp) {
+        this.playHitSfx();
+      }
+      if (oppNow) this.prevOppHp = oppNow.hp;
+
+      // 从状态变化里推断音效：自己的地翻好了 / 自己的作物被砸了
+      if (prevMe && me && prevMe.field) {
+        const before = countTilled(prevMe.field);
+        const after = countTilled(me.field);
+        if (after > before) audio.sfx('till');
+        const cropBefore = countCrops(prevMe.field);
+        const cropAfter = countCrops(me.field);
+        if (cropAfter < cropBefore) audio.sfx('smash');
+      }
+
       if (msg.state.state === 'playing' && !this.started) {
         this.started = true;
+        audio.startMusic();
         if (typeof this.onReady === 'function') this.onReady(msg.state);
       }
       if (msg.state.state === 'ended' && !this.gameOverShown) {
         this.gameOverShown = true;
+        audio.sfx(msg.state.winner === this.role ? 'win' : 'lose');
         this.showGameOver();
       }
     });
@@ -401,6 +458,7 @@ export class MPGame {
       this._lastErrAt = this._lastErrAt || {};
       if (now - (this._lastErrAt[msg.message] || 0) < 1500) return;
       this._lastErrAt[msg.message] = now;
+      audio.sfx('deny');
       this.toast('⚠ ' + msg.message, '#FF8A80');
     });
   }
@@ -499,6 +557,7 @@ export class MPGame {
         y: Math.round(this.local.y * 10) / 10,
         facing: this.local.facing,
         charge: Math.round(this.chargeRatio() * 100) / 100,
+        till: this.holdTillTarget(),
       });
     }
 
@@ -507,9 +566,31 @@ export class MPGame {
       this.toasts[i].life -= dt;
       if (this.toasts[i].life <= 0) this.toasts.splice(i, 1);
     }
+
+    // 攒下来的受伤提示：最多每 0.7 秒合并提示一次
+    if (this.pendingDmg > 0 && performance.now() - (this.dmgToastAt || 0) > 700) {
+      this.dmgToastAt = performance.now();
+      this.toast(`你受到 ${this.pendingDmg} 伤害！`, '#FF8A80');
+      this.pendingDmg = 0;
+    }
   }
 
   // ===== 操作 =====
+  // 受伤/命中音效：状态每 40ms 推一次，这里做节流避免刷屏
+  playHurtSfx() {
+    const now = performance.now();
+    if (now - (this._hurtAt || 0) < 320) return;
+    this._hurtAt = now;
+    audio.sfx('hurt');
+  }
+
+  playHitSfx() {
+    const now = performance.now();
+    if (now - (this._hitAt || 0) < 320) return;
+    this._hitAt = now;
+    audio.sfx('hit', 0.85);
+  }
+
   // 蓄力进度 0~1（按当前选中蔬菜的蓄力时间归一化）
   chargeRatio() {
     const sel = PLANT_TYPES[this.selected];
@@ -524,6 +605,7 @@ export class MPGame {
       y: Math.round(this.local.y * 10) / 10,
       facing: this.local.facing,
       charge: Math.round(this.chargeRatio() * 100) / 100,
+      till: this.holdTillTarget(),
     });
     this.lastMoveSent = performance.now();
   }
@@ -540,21 +622,11 @@ export class MPGame {
     return FARMS[this.role];
   }
 
+  // 交互目标就是角色脚下踩着的那块地
   getTargetTile() {
     const origin = this.myFarmOrigin();
-    let tx = this.local.x, ty = this.local.y - 12;
-    const f = this.local.facing;
-    if (f === 'up') ty -= REACH;
-    else if (f === 'down') ty += REACH;
-    else if (f === 'left') tx -= REACH;
-    else tx += REACH;
-
-    let col = Math.floor((tx - origin.x) / CELL);
-    let row = Math.floor((ty - origin.y) / CELL);
-    if (row >= 0 && row < FARM_ROWS && col >= 0 && col < FARM_COLS) return { r: row, c: col };
-
-    col = Math.floor((this.local.x - origin.x) / CELL);
-    row = Math.floor((this.local.y - origin.y) / CELL);
+    const col = Math.floor((this.local.x - origin.x) / CELL);
+    const row = Math.floor((this.local.y - origin.y) / CELL);
     if (row >= 0 && row < FARM_ROWS && col >= 0 && col < FARM_COLS) return { r: row, c: col };
     return null;
   }
@@ -568,11 +640,22 @@ export class MPGame {
     return null;
   }
 
+  // 长按 E 翻地：按住时把目标地块上报给服务端，由服务端累计按住时长
+  holdTillTarget() {
+    if (!this.keys['e'] || !this.state || this.state.state !== 'playing') return null;
+    const target = this.getTargetTile();
+    if (!target) return null;
+    const me = this.me();
+    const tile = me && me.field[target.r][target.c];
+    if (!tile || tile.tilled) return null;
+    return { row: target.r, col: target.c };
+  }
+
   tryInteract() {
     if (this.interactCd > 0 || !this.state || this.state.state !== 'playing') return;
     const target = this.getTargetTile();
     if (!target) {
-      this.toast('走到自家农田旁，面朝地块按 E', '#FFD700');
+      this.toast('站到自家农田的地块上按 E', '#FFD700');
       return;
     }
     const me = this.me();
@@ -582,17 +665,21 @@ export class MPGame {
     this.flushMove(); // 先同步位置，服务端按顺序校验
 
     if (!tile.tilled) {
-      this.net.action('till', { row: target.r, col: target.c });
+      this.toast('长按 E 翻地', '#D7B377');
     } else if (!tile.plant) {
       if ((me.seeds[this.selected] || 0) <= 0) {
+        audio.sfx('deny');
         this.toast(`没有${PLANT_TYPES[this.selected].name}种子，点下方按钮购买`, '#FF8A80');
         return;
       }
       this.net.action('plant', { row: target.r, col: target.c, plantId: this.selected });
+      audio.sfx('plant');
     } else if (tile.mature) {
       this.net.action('harvest', { row: target.r, col: target.c });
+      audio.sfx('harvest');
     } else if (!tile.watered) {
       this.net.action('water', { row: target.r, col: target.c });
+      audio.sfx('water');
     } else {
       this.toast('作物正在生长中...', '#AAA');
       return;
@@ -637,12 +724,19 @@ export class MPGame {
       ? (dx > 0 ? 'right' : 'left')
       : (dy > 0 ? 'down' : 'up');
     this.throwCd = 0.5;
+    audio.sfx('throw');
   }
 
   handleKey(k) {
+    if (k === 'm') {
+      const muted = audio.toggleMute();
+      this.toast(muted ? '\u{1F507} 已静音' : '\u{1F50A} 音乐已开启', '#FFD700');
+      return;
+    }
     if (!this.state || this.state.state !== 'playing') return;
     if (k >= '1' && k <= '6') {
       this.selected = PLANT_ORDER[parseInt(k) - 1];
+      audio.sfx('click');
       this.toast(`选中 ${PLANT_TYPES[this.selected].name}`, PLANT_TYPES[this.selected].color);
       return;
     }
@@ -657,6 +751,7 @@ export class MPGame {
         const pid = PLANT_ORDER[i];
         this.selected = pid;
         this.net.action('buy', { plantId: pid });
+        audio.sfx('buy');
         return true;
       }
     }
@@ -713,7 +808,7 @@ export class MPGame {
       facing: this.local.facing,
       moving: this.local.moving,
       walkFrame: this.local.walkFrame,
-      hitFlash: 0,
+      hitFlash: (me?.dot > 0) ? 0.1 : 0,   // 灼烧期间持续红闪
       selected: this.selected,
       veggies: me?.veggies || {},
       hp: me?.hp ?? 0,
@@ -730,7 +825,7 @@ export class MPGame {
       facing: opp.facing || 'down',
       moving: false,
       walkFrame: 0,
-      hitFlash: 0,
+      hitFlash: (opp.dot > 0) ? 0.1 : 0,   // 灼烧期间持续红闪
       selected: Object.keys(opp.veggies || {})[0] || 'carrot',
       veggies: opp.veggies || {},
       hp: opp.hp,
@@ -777,6 +872,31 @@ export class MPGame {
         // 地块贴图（三种状态预渲染）
         const tt = !tile.tilled ? tileTex.untilled : (tile.watered ? tileTex.watered : tileTex.tilled);
         ctx.drawImage(tt, x + 1, y + 1);
+
+        // 翻好但一直没种：快到荒废时间时闪褐色警示
+        if (tile.tilled && !tile.plant) {
+          const idle = tile.idleTimer || 0;
+          if (idle > TILL_IDLE_TIME * 0.6) {
+            const pulse = 0.5 + Math.sin(performance.now() / 140) * 0.5;
+            ctx.fillStyle = `rgba(90,60,25,${0.18 + pulse * 0.22})`;
+            ctx.fillRect(x + 1, y + 1, CELL - 2, CELL - 2);
+            ctx.fillStyle = `rgba(255,190,90,${0.55 + pulse * 0.45})`;
+            ctx.font = 'bold 9px monospace';
+            ctx.fillText('⌛', x + 3, y + 12);
+          }
+        }
+
+        // 长按翻地进度条（双方的进度都由服务端结算后同步过来）
+        if (!tile.tilled && farmer.tillHold > 0 && farmer.tillTarget &&
+            farmer.tillTarget.row === r && farmer.tillTarget.col === c) {
+          const prog = Math.min(1, farmer.tillHold / TILL_HOLD_TIME);
+          const bw = CELL - 8, bh = 5;
+          const bx = x + 4, by = y + CELL - 10;
+          ctx.fillStyle = 'rgba(0,0,0,0.65)';
+          ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
+          ctx.fillStyle = '#D7B377';
+          ctx.fillRect(bx, by, bw * prog, bh);
+        }
 
         if (tile.plant) {
           const prog = tile.maxGrowth > 0 ? tile.growth / tile.maxGrowth : 0;
@@ -827,7 +947,7 @@ export class MPGame {
 
     const action = this.tileAction(tile);
     if (action) {
-      const label = `E ${action}`;
+      const label = (tile.tilled ? 'E ' : '长按E ') + action;
       ctx.font = 'bold 9px monospace';
       const tw = ctx.measureText(label).width + 8;
       const bx = x + CELL / 2 - tw / 2;
@@ -1006,14 +1126,19 @@ export class MPGame {
     if (!this.state) return;
     for (const p of this.state.projectiles) {
       const bob = Math.sin((p.t || 0) * 12) * 1.5;
+      // 土豆：飞行越久涨得越大（1 倍 → 2 倍）；南瓜：巨型滚动弹
+      const scale = p.plantId === 'potato' ? Math.min(2, 1 + (p.t || 0) * 0.35)
+                  : p.plantId === 'pumpkin' ? 2 : 1;
+      const w = 18 * scale, h = 18 * scale;
+      const shScale = p.plantId === 'potato' ? scale : 1;
       ctx.fillStyle = 'rgba(0,0,0,0.2)';
       ctx.beginPath();
-      ctx.ellipse(p.x, p.y + 10, p.size * 0.8, p.size * 0.4, 0, 0, Math.PI * 2);
+      ctx.ellipse(p.x, p.y + 10, (p.size * 0.8) * shScale, (p.size * 0.4) * shScale, 0, 0, Math.PI * 2);
       ctx.fill();
       // 蔬菜本体（成熟形态像素图，飞出去也认得出是什么菜）
       const tex = itemTextures[p.plantId];
       if (tex) {
-        ctx.drawImage(tex, Math.round(p.x - 9), Math.round(p.y - 15 + bob), 18, 18);
+        ctx.drawImage(tex, Math.round(p.x - w / 2), Math.round(p.y - 15 + bob - (h - 18) / 2), w, h);
       }
     }
   }
@@ -1046,6 +1171,17 @@ export class MPGame {
     ctx.textAlign = 'center';
     ctx.fillText(`${m}:${s.toString().padStart(2, '0')}`, CANVAS_W / 2, 19);
     ctx.textAlign = 'start';
+
+    // 金币阶段提示（每过一个阶段被动金币 +0.3/秒）
+    const elapsed = this.state?.elapsed || 0;
+    const stage = coinStageAt(elapsed) + 1;
+    ctx.fillStyle = '#FFD54F';
+    ctx.font = '8px monospace';
+    ctx.fillText(`阶段 ${stage}/${COIN_STAGE_COUNT} · 金币 +${coinRateAt(elapsed).toFixed(1)}/秒`, CANVAS_W / 2 + 34, 19);
+
+    // 静音状态（M 键切换）
+    ctx.font = '10px monospace';
+    ctx.fillText(audio.isMuted() ? '\u{1F507}' : '\u{1F50A}', CANVAS_W - 8 - 120 - 18, 19);
   }
 
   drawHPBar(ctx, x, y, farmer, alignRight) {

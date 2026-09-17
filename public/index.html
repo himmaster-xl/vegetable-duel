@@ -21,13 +21,25 @@
         <div class="controls-hint">
           <h3>🎮 操作说明</h3>
           <p>WASD / 方向键 — 移动角色</p>
-          <p>E — 与地块交互（翻地/播种/浇水/收获）</p>
+          <p>E — 播种/浇水/收获；翻地需要长按 E 半秒</p>
           <p>长按空格 — 蓄力（各蔬菜蓄力时间不同，满蓄力 3 倍速）</p>
           <p>松开空格 — 蓄力会逐渐衰减，要尽快出手</p>
           <p>鼠标左键点击 — 朝点击位置投掷蔬菜</p>
           <p>鼠标右键点下方按钮 — 购买种子</p>
           <p>1~6 — 选择种子</p>
+          <p>M — 静音 / 开启音乐（8-bit 背景音乐 + 音效）</p>
           <p>下方按钮 — 购买种子</p>
+          <p>翻好的地 15 秒内不种会自动荒废（变回未耕种）</p>
+          <p>被动金币随阶段提速：每 45 秒一个阶段，每阶段 +0.3/秒（1.0 → 1.9/秒）</p>
+        </div>
+        <div class="controls-hint">
+          <h3>🥕 蔬菜特性</h3>
+          <p>胡萝卜 — 穿透目标，同一目标只结算一次</p>
+          <p>土豆 — 飞行越久个头越大、伤害越高（最多 2 倍）</p>
+          <p>辣椒 — 命中持续灼烧 4 秒；烧毁的地块要重新翻地</p>
+          <p>玉米 — 蓄力越满连发越多（满蓄力 5 枚）</p>
+          <p>南瓜 — 巨型滚动弹，碾碎路径上所有作物</p>
+          <p>大蒜 — 蛇形轨迹（振幅更大），碰到作物或玩家就消失</p>
         </div>
         <div class="lobby-inputs">
           <label>
@@ -72,8 +84,8 @@
   </div>
 
   <!-- 单人模式：无外部依赖，独立运行 -->
-  <script type="module" src="/src/sp-game.js?v=19"></script>
+  <script type="module" src="/src/sp-game.js?v=28"></script>
   <!-- 多人联机模式：加载完整版 -->
-  <script type="module" src="/src/mp-loader.js?v=18"></script>
+  <script type="module" src="/src/mp-loader.js?v=25"></script>
 </body>
 </html>
